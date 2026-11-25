@@ -2,6 +2,80 @@
 #include "PluginEditor.h"
 #include <cmath>
 
+namespace
+{
+    bool writeWav (const juce::File& file, const juce::AudioBuffer<float>& buf, double rate)
+    {
+        file.deleteFile();
+        std::unique_ptr<juce::FileOutputStream> os (file.createOutputStream());
+        if (os == nullptr) return false;
+
+        juce::WavAudioFormat wav;
+        std::unique_ptr<juce::AudioFormatWriter> writer (
+            wav.createWriterFor (os.get(), rate, (unsigned int) buf.getNumChannels(), 24, {}, 0));
+        if (writer == nullptr) return false;
+
+        os.release();   // el writer se encarga del stream
+        return writer->writeFromAudioSampleBuffer (buf, 0, buf.getNumSamples());
+    }
+}
+
+//==============================================================================
+// Hilo de analisis: lee la cancion, detecta, clasifica, agrupa y aisla
+struct DrumkitProcessor::CloneJob : public juce::Thread
+{
+    CloneJob (DrumkitProcessor& p, juce::File f, std::shared_ptr<juce::AudioBuffer<float>> existing,
+              double rate, juce::String srcName, float sens)
+        : juce::Thread ("Drumkit Cloner analysis"), owner (p), file (std::move (f)),
+          buffer (std::move (existing)), sampleRate (rate), name (std::move (srcName)), sensitivity (sens) {}
+
+    ~CloneJob() override { stopThread (20000); }
+
+    void run() override
+    {
+        bool ok = true;
+
+        if (buffer == nullptr)
+        {
+            buffer = owner.readAudioFile (file, sampleRate, 8.0 * 60.0);   // maximo 8 minutos
+            name = file.getFileNameWithoutExtension();
+        }
+        if (threadShouldExit()) return;
+
+        std::shared_ptr<dkc::AnalysisResult> result;
+        if (buffer == nullptr)
+        {
+            ok = false;
+        }
+        else
+        {
+            result = std::make_shared<dkc::AnalysisResult> (
+                dkc::analyse (*buffer, sampleRate, sensitivity, &owner.cloneProgress,
+                              [this] { return threadShouldExit(); }));
+            result->name = name;
+            if (threadShouldExit()) return;
+        }
+
+        juce::WeakReference<DrumkitProcessor> weak (&owner);
+        auto buf = buffer;
+        const double sr = sampleRate;
+        const juce::String nm = name;
+
+        juce::MessageManager::callAsync ([weak, buf, sr, nm, result, ok]
+        {
+            if (weak != nullptr)
+                weak->finishJob (buf, sr, nm, result, ok);
+        });
+    }
+
+    DrumkitProcessor& owner;
+    juce::File file;
+    std::shared_ptr<juce::AudioBuffer<float>> buffer;
+    double sampleRate;
+    juce::String name;
+    float sensitivity;
+};
+
 //==============================================================================
 void DrumkitProcessor::Biquad::set (bool highPass, double sr, float freq)
 {
@@ -43,6 +117,8 @@ juce::AudioProcessorValueTreeState::ParameterLayout DrumkitProcessor::createLayo
             ParameterID { id, 1 }, name, NormalisableRange<float> (lo, hi, 0.0f, skew), def));
     };
 
+    addFloat ("bpm", "BPM", 40.0f, 240.0f, 90.0f);
+
     for (int p = 0; p < dkc::numPads; ++p)
     {
         const String n = "Pad " + String (p + 1) + " ";
@@ -75,6 +151,9 @@ DrumkitProcessor::DrumkitProcessor()
 {
     formatManager.registerBasicFormats();
 
+    for (auto& v : pattern) v.store (0);
+    bpmParam = apvts.getRawParameterValue ("bpm");
+
     for (int p = 0; p < dkc::numPads; ++p)
     {
         auto get = [this, p] (const char* id) { return apvts.getRawParameterValue (dkc::pid (p, id)); };
@@ -86,7 +165,10 @@ DrumkitProcessor::DrumkitProcessor()
     }
 }
 
-DrumkitProcessor::~DrumkitProcessor() {}
+DrumkitProcessor::~DrumkitProcessor()
+{
+    job.reset();   // para el hilo de analisis antes de destruir el resto
+}
 
 bool DrumkitProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
 {
@@ -114,28 +196,55 @@ juce::AudioProcessorEditor* DrumkitProcessor::createEditor()
 }
 
 //==============================================================================
-bool DrumkitProcessor::loadSample (int pad, const juce::File& file)
+std::shared_ptr<juce::AudioBuffer<float>> DrumkitProcessor::readAudioFile (const juce::File& file, double& rate, double maxSeconds)
 {
-    if (pad < 0 || pad >= dkc::numPads || ! file.existsAsFile())
-        return false;
+    if (! file.existsAsFile()) return nullptr;
 
     std::unique_ptr<juce::AudioFormatReader> reader (formatManager.createReaderFor (file));
     if (reader == nullptr || reader->lengthInSamples <= 0)
-        return false;
+        return nullptr;
 
-    const juce::int64 maxLen = (juce::int64) (reader->sampleRate * 30.0);   // maximo 30 s por pad
+    rate = reader->sampleRate;
+    const juce::int64 maxLen = (juce::int64) (reader->sampleRate * maxSeconds);
     const int numSamples = (int) juce::jmin (reader->lengthInSamples, maxLen);
     const int numChannels = (int) juce::jmin (2u, reader->numChannels);
 
     auto buf = std::make_shared<juce::AudioBuffer<float>> (numChannels, numSamples);
-    reader->read (buf.get(), 0, numSamples, 0, true, true);
+    if (! reader->read (buf.get(), 0, numSamples, 0, true, true))
+        return nullptr;
+    return buf;
+}
+
+bool DrumkitProcessor::loadSample (int pad, const juce::File& file)
+{
+    if (pad < 0 || pad >= dkc::numPads) return false;
+
+    double rate = 44100.0;
+    auto buf = readAudioFile (file, rate, 30.0);   // maximo 30 s por pad
+    if (buf == nullptr) return false;
+
+    // Si existe "NOMBRE_raw.wav" al lado (kits clonados), se carga como golpe real
+    std::shared_ptr<juce::AudioBuffer<float>> alt;
+    const auto rawFile = file.getSiblingFile (file.getFileNameWithoutExtension() + "_raw.wav");
+    if (rawFile.existsAsFile())
+    {
+        double r2 = rate;
+        alt = readAudioFile (rawFile, r2, 30.0);
+        if (alt != nullptr && (alt->getNumSamples() != buf->getNumSamples()
+                               || alt->getNumChannels() != buf->getNumChannels()))
+            alt = nullptr;
+    }
 
     {
         const juce::SpinLock::ScopedLockType sl (slotLock);
         keepAlive.push_back (buf);
+        if (alt != nullptr) keepAlive.push_back (alt);
+
         auto& s = slots[(size_t) pad];
         s.data = buf.get();
-        s.rate = reader->sampleRate;
+        s.alt = alt != nullptr ? alt.get() : nullptr;
+        s.rate = rate;
+        s.family = -1;
         s.name = file.getFileNameWithoutExtension();
         s.path = file.getFullPathName();
     }
@@ -156,6 +265,13 @@ juce::String DrumkitProcessor::getPadName (int pad) const
     if (pad < 0 || pad >= dkc::numPads) return {};
     const juce::SpinLock::ScopedLockType sl (slotLock);
     return slots[(size_t) pad].name;
+}
+
+int DrumkitProcessor::getPadFamily (int pad) const
+{
+    if (pad < 0 || pad >= dkc::numPads) return -1;
+    const juce::SpinLock::ScopedLockType sl (slotLock);
+    return slots[(size_t) pad].family;
 }
 
 //==============================================================================
@@ -183,6 +299,7 @@ void DrumkitProcessor::updateSnapshots()
         s.useHp = s.hp > 20.5f;
         s.useLp = s.lp < 19500.0f;
 
+        s.cleanAmt = juce::jlimit (0.0f, 1.0f, pp.clean->load());
         s.mute  = pp.mute->load() > 0.5f;
         s.solo  = pp.solo->load() > 0.5f;
         s.out   = (int) std::lround (pp.out->load());
@@ -202,6 +319,9 @@ void DrumkitProcessor::trigger (int pad, float velocity)
     auto& v = voices[(size_t) pad];
     v.data = slots[(size_t) pad].data;
     v.srcRate = slots[(size_t) pad].rate;
+    v.alt = slots[(size_t) pad].alt;
+    if (v.alt != nullptr && (v.alt->getNumSamples() != v.data->getNumSamples() || v.alt->getNumChannels() < 1))
+        v.alt = nullptr;
     v.pos = 0.0;
     v.age = 0;
     v.vel = velocity;
@@ -264,6 +384,9 @@ void DrumkitProcessor::render (juce::AudioBuffer<float>& buffer, int start, int 
         const float* L = v.data->getReadPointer (0);
         const float* R = v.data->getNumChannels() > 1 ? v.data->getReadPointer (1) : L;
         const int len = v.data->getNumSamples();
+        const bool useAlt = v.alt != nullptr && s.cleanAmt < 0.999f;
+        const float* AL = useAlt ? v.alt->getReadPointer (0) : nullptr;
+        const float* AR = useAlt ? (v.alt->getNumChannels() > 1 ? v.alt->getReadPointer (1) : AL) : nullptr;
         const double step = v.srcRate / hostRate * s.tuneRatio;
 
         for (int i = start; i < end; ++i)
@@ -274,6 +397,14 @@ void DrumkitProcessor::render (juce::AudioBuffer<float>& buffer, int start, int 
             const float frac = (float) (v.pos - (double) i0);
             float l = L[i0] + (L[i0 + 1] - L[i0]) * frac;
             float r = R[i0] + (R[i0 + 1] - R[i0]) * frac;
+
+            if (useAlt)   // Clean: 0 = golpe real, 1 = mediana limpia
+            {
+                const float al = AL[i0] + (AL[i0 + 1] - AL[i0]) * frac;
+                const float ar = AR[i0] + (AR[i0 + 1] - AR[i0]) * frac;
+                l = al + (l - al) * s.cleanAmt;
+                r = ar + (r - ar) * s.cleanAmt;
+            }
 
             if (s.useHp) { l = v.hp.process (0, l); r = v.hp.process (1, r); }
             if (s.useLp) { l = v.lp.process (0, l); r = v.lp.process (1, r); }
@@ -309,6 +440,33 @@ void DrumkitProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
     const int numSamples = buffer.getNumSamples();
     buffer.clear();
 
+    // Secuenciador interno: inyecta las notas del patron en el buffer MIDI
+    const bool playing = seqPlaying.load();
+    if (playing && ! wasPlaying) { seqStep = 0; nextStepIn = 0.0; }
+    if (! playing && wasPlaying) currentStep.store (-1);
+    wasPlaying = playing;
+
+    if (playing)
+    {
+        const double bpm = juce::jlimit (40.0, 240.0, (double) bpmParam->load());
+        const double stepLen = 60.0 / bpm / 4.0 * hostRate;
+        double t = nextStepIn;
+
+        while (t < (double) numSamples)
+        {
+            currentStep.store (seqStep);
+            for (int p = 0; p < dkc::numPads; ++p)
+            {
+                const int vel = pattern[p * dkc::numSteps + seqStep].load();
+                if (vel > 0)
+                    midi.addEvent (juce::MidiMessage::noteOn (1, dkc::firstMidiNote + p, (juce::uint8) vel), (int) t);
+            }
+            seqStep = (seqStep + 1) % dkc::numSteps;
+            t += stepLen;
+        }
+        nextStepIn = t - (double) numSamples;
+    }
+
     // Mezcla los clicks de los pads de la interfaz con el MIDI del DAW
     keyboardState.processNextMidiBuffer (midi, 0, numSamples, true);
 
@@ -343,9 +501,25 @@ void DrumkitProcessor::getStateInformation (juce::MemoryBlock& dest)
         const juce::SpinLock::ScopedLockType sl (slotLock);
         for (int p = 0; p < dkc::numPads; ++p)
             if (slots[(size_t) p].path.isNotEmpty())
+            {
                 samples.setProperty ("pad" + juce::String (p), slots[(size_t) p].path, nullptr);
+                samples.setProperty ("fam" + juce::String (p), slots[(size_t) p].family, nullptr);
+            }
     }
     state.appendChild (samples, nullptr);
+
+    auto oldExtra = state.getChildWithName ("EXTRA");
+    if (oldExtra.isValid()) state.removeChild (oldExtra, nullptr);
+
+    juce::ValueTree extra ("EXTRA");
+    juce::MemoryBlock mb ((size_t) (dkc::numPads * dkc::numSteps), true);
+    auto* bytes = static_cast<juce::uint8*> (mb.getData());
+    for (int i = 0; i < dkc::numPads * dkc::numSteps; ++i)
+        bytes[i] = pattern[i].load();
+    extra.setProperty ("pattern", mb.toBase64Encoding(), nullptr);
+    extra.setProperty ("accent", accentIndex.load(), nullptr);
+    extra.setProperty ("sens", sensitivity.load(), nullptr);
+    state.appendChild (extra, nullptr);
 
     juce::MemoryOutputStream mos (dest, false);
     state.writeToStream (mos);
@@ -359,12 +533,235 @@ void DrumkitProcessor::setStateInformation (const void* data, int size)
 
     apvts.replaceState (tree);
 
+    auto extra = tree.getChildWithName ("EXTRA");
+    if (extra.isValid())
+    {
+        juce::MemoryBlock mb;
+        if (mb.fromBase64Encoding (extra.getProperty ("pattern").toString())
+            && mb.getSize() == (size_t) (dkc::numPads * dkc::numSteps))
+        {
+            auto* bytes = static_cast<const juce::uint8*> (mb.getData());
+            for (int i = 0; i < dkc::numPads * dkc::numSteps; ++i)
+                pattern[i].store (bytes[i]);
+        }
+        accentIndex.store ((int) extra.getProperty ("accent", 0));
+        sensitivity.store ((float) (double) extra.getProperty ("sens", 0.5));
+    }
+
     auto samples = tree.getChildWithName ("SAMPLES");
     for (int p = 0; p < dkc::numPads; ++p)
     {
         const auto path = samples.getProperty ("pad" + juce::String (p)).toString();
-        if (path.isNotEmpty())
-            loadSample (p, juce::File (path));
+        if (path.isNotEmpty() && loadSample (p, juce::File (path)))
+        {
+            const juce::SpinLock::ScopedLockType sl (slotLock);
+            slots[(size_t) p].family = (int) samples.getProperty ("fam" + juce::String (p), -1);
+        }
+    }
+}
+
+//==============================================================================
+dkc::PitchResult DrumkitProcessor::analysePitch (int pad) const
+{
+    if (pad < 0 || pad >= dkc::numPads) return {};
+
+    const juce::AudioBuffer<float>* data = nullptr;
+    double rate = 44100.0;
+    {
+        const juce::SpinLock::ScopedLockType sl (slotLock);
+        data = slots[(size_t) pad].data;
+        rate = slots[(size_t) pad].rate;
+    }
+    if (data == nullptr) return {};
+    return dkc::detectPitch (*data, rate);
+}
+
+dkc::PitchResult DrumkitProcessor::tunePad (int pad, float targetMidi, bool snapToNearest)
+{
+    auto r = analysePitch (pad);
+    if (! r.valid) return r;
+
+    const float target = snapToNearest ? std::round (r.midiNote) : targetMidi;
+    const float semis = juce::jlimit (-24.0f, 24.0f, target - r.midiNote);
+
+    if (auto* prm = apvts.getParameter (dkc::pid (pad, "tune")))
+    {
+        prm->beginChangeGesture();
+        prm->setValueNotifyingHost (prm->convertTo0to1 (semis));
+        prm->endChangeGesture();
+    }
+    return r;
+}
+
+//==============================================================================
+int DrumkitProcessor::getStepVel (int pad, int step) const
+{
+    if (pad < 0 || pad >= dkc::numPads || step < 0 || step >= dkc::numSteps) return 0;
+    return pattern[pad * dkc::numSteps + step].load();
+}
+
+void DrumkitProcessor::setStepVel (int pad, int step, int vel)
+{
+    if (pad < 0 || pad >= dkc::numPads || step < 0 || step >= dkc::numSteps) return;
+    pattern[pad * dkc::numSteps + step].store ((juce::uint8) juce::jlimit (0, 127, vel));
+}
+
+void DrumkitProcessor::clearPattern()
+{
+    for (auto& v : pattern) v.store (0);
+}
+
+bool DrumkitProcessor::writeMidiFile (const juce::File& file) const
+{
+    constexpr int tpq = 480;
+    constexpr int stepTicks = tpq / 4;
+    constexpr int noteTicks = 100;
+
+    const double bpm = juce::jlimit (40.0, 240.0, (double) bpmParam->load());
+
+    juce::MidiMessageSequence tempoTrack, notes;
+    tempoTrack.addEvent (juce::MidiMessage::tempoMetaEvent ((int) (60000000.0 / bpm)));
+    tempoTrack.addEvent (juce::MidiMessage::timeSignatureMetaEvent (4, 4));
+
+    for (int p = 0; p < dkc::numPads; ++p)
+    {
+        for (int s = 0; s < dkc::numSteps; ++s)
+        {
+            const int vel = pattern[p * dkc::numSteps + s].load();
+            if (vel <= 0) continue;
+
+            const int note = dkc::firstMidiNote + p;
+            auto on = juce::MidiMessage::noteOn (1, note, (juce::uint8) vel);
+            on.setTimeStamp ((double) (s * stepTicks));
+            notes.addEvent (on);
+
+            auto off = juce::MidiMessage::noteOff (1, note);
+            off.setTimeStamp ((double) (s * stepTicks + noteTicks));
+            notes.addEvent (off);
+        }
+    }
+    notes.sort();
+    notes.updateMatchedPairs();
+
+    juce::MidiFile mf;
+    mf.setTicksPerQuarterNote (tpq);
+    mf.addTrack (tempoTrack);
+    mf.addTrack (notes);
+
+    file.deleteFile();
+    juce::FileOutputStream out (file);
+    if (! out.openedOk()) return false;
+    return mf.writeTo (out);
+}
+
+//==============================================================================
+void DrumkitProcessor::setParam (const juce::String& id, float plainValue)
+{
+    if (auto* prm = apvts.getParameter (id))
+    {
+        prm->beginChangeGesture();
+        prm->setValueNotifyingHost (prm->convertTo0to1 (plainValue));
+        prm->endChangeGesture();
+    }
+}
+
+bool DrumkitProcessor::cloneFromFile (const juce::File& file)
+{
+    if (isCloning() || ! file.existsAsFile()) return false;
+    startJob (file, nullptr, 44100.0, file.getFileNameWithoutExtension());
+    return true;
+}
+
+bool DrumkitProcessor::recloneSource()
+{
+    if (isCloning() || sourceBuffer == nullptr) return false;
+    startJob ({}, sourceBuffer, sourceRate, sourceName);
+    return true;
+}
+
+void DrumkitProcessor::startJob (const juce::File& file, std::shared_ptr<juce::AudioBuffer<float>> existing,
+                                 double rate, const juce::String& name)
+{
+    cloneStatus = {};
+    cloneProgress.store (0.0f);
+    job = std::make_unique<CloneJob> (*this, file, std::move (existing), rate, name, sensitivity.load());
+    job->startThread();
+    sendChangeMessage();
+}
+
+void DrumkitProcessor::finishJob (std::shared_ptr<juce::AudioBuffer<float>> buf, double sr, const juce::String& name,
+                                  std::shared_ptr<const dkc::AnalysisResult> result, bool ok)
+{
+    cloneProgress.store (-1.0f);
+    job.reset();
+
+    if (! ok || buf == nullptr || result == nullptr)
+    {
+        cloneStatus = "No se pudo leer el archivo de audio";
+        sendChangeMessage();
+        return;
+    }
+
+    sourceBuffer = buf;
+    sourceRate = sr;
+    sourceName = name;
+    analysis = result;
+
+    if (result->sounds.empty())
+    {
+        cloneStatus = "No se detectaron golpes claros: sube la sensibilidad";
+    }
+    else
+    {
+        installClone (*result);
+        cloneStatus = {};
+    }
+    sendChangeMessage();
+}
+
+void DrumkitProcessor::installClone (const dkc::AnalysisResult& res)
+{
+    // Los one-shots se guardan en Musica/Drumkit Cloner/Kits/<cancion>/ para que el proyecto los recuerde
+    const auto folder = juce::File::getSpecialLocation (juce::File::userMusicDirectory)
+                            .getChildFile ("Drumkit Cloner").getChildFile ("Kits")
+                            .getChildFile (juce::File::createLegalFileName (res.name.isEmpty() ? juce::String ("Kit") : res.name));
+    folder.createDirectory();
+
+    {
+        const juce::SpinLock::ScopedLockType sl (slotLock);
+        for (auto& s : slots) s = Slot();
+    }
+
+    for (const auto& snd : res.sounds)
+    {
+        const int pad = snd.pad;
+        const auto base = juce::File::createLegalFileName (snd.name);
+        const auto cleanFile = folder.getChildFile (base + ".wav");
+        const auto rawFile = folder.getChildFile (base + "_raw.wav");
+        const bool saved = writeWav (cleanFile, snd.clean, res.sampleRate);
+        writeWav (rawFile, snd.raw, res.sampleRate);
+
+        auto cleanBuf = std::make_shared<juce::AudioBuffer<float>> (snd.clean);
+        auto rawBuf = std::make_shared<juce::AudioBuffer<float>> (snd.raw);
+        {
+            const juce::SpinLock::ScopedLockType sl (slotLock);
+            keepAlive.push_back (cleanBuf);
+            keepAlive.push_back (rawBuf);
+            auto& s = slots[(size_t) pad];
+            s.data = cleanBuf.get();
+            s.alt = rawBuf.get();
+            s.rate = res.sampleRate;
+            s.family = snd.family;
+            s.name = snd.name;
+            s.path = saved ? cleanFile.getFullPathName() : juce::String();
+        }
+
+        setParam (dkc::pid (pad, "tune"), 0.0f);
+        setParam (dkc::pid (pad, "clean"), 1.0f);
+        setParam (dkc::pid (pad, "mute"), 0.0f);
+        setParam (dkc::pid (pad, "solo"), 0.0f);
+        setParam (dkc::pid (pad, "out"), (float) (snd.family + 1));                       // salida separada por familia
+        setParam (dkc::pid (pad, "choke"), (snd.family == dkc::Hat || snd.family == dkc::OpenHat) ? 1.0f : 0.0f);
     }
 }
 

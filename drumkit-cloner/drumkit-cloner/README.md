@@ -1,10 +1,32 @@
-# Drumkit Cloner (Fase 1: sampler de 64 pads)
+# Drumkit Cloner (v0.3)
 
 Plugin de bateria hecho con JUCE: VST3 + Standalone (+ AU en Mac).
 
 **Incluye ahora:** 64 pads en 4 bancos (A-D), MIDI desde C1 (nota 36), arrastrar samples a los
 pads, y por pad: Gain, Pan, Tune, Attack, Fade, HP, LP (12 dB/oct), Choke, Mute, Solo y salida
 separada (Main + 8 salidas estereo). Todo automatizable desde el DAW.
+
+**Novedades v0.3 - CLONAR KITS:**
+- Arrastra una cancion o un loop al panel **SOURCE** (o usa **BROWSE**). El plugin detecta cada golpe,
+  lo clasifica (kick, snare, clap, hat, open hat, tom, perc, cymbal), agrupa los que suenan igual,
+  apila los golpes de cada grupo y se queda con lo que se repite (mediana) para aislar el sonido.
+- Cada sonido va a un pad: kick en C1, snare en D1, hat en F#1, open hat en A#1; el resto en pads libres.
+- **SENSITIVITY** + **RE-CLONE** repiten el analisis sin volver a cargar el archivo.
+- El knob **CLEAN** mezcla entre el golpe real (0) y la version limpia por mediana (1).
+- Los one-shots se guardan en `Musica/Drumkit Cloner/Kits/<cancion>/` y el proyecto los recuerda.
+- Hats y open hats quedan en el mismo grupo de choke; cada familia sale por su salida separada.
+
+**Limitaciones de la deteccion (sin IA):** con voces o acordes muy marcados puede detectar golpes falsos;
+la clasificacion usa reglas, no un modelo entrenado. El modo IA (separar la bateria antes de analizar)
+y varios kits por cancion son la siguiente fase.
+
+**Novedades v0.2:**
+- **Corrector de pitch:** DETECT muestra la nota del sample; TUNE lo afina a la nota que elijas;
+  SNAP lo ajusta a la nota mas cercana; TUNE ALL afina todos los pads a la misma nota.
+- **Patron MIDI:** boton EDIT abre una rejilla de 32 pasos (1/16, 2 compases) por pad.
+  Click pone/quita, arrastrar pinta, click derecho cambia la fuerza. PLAY lo reproduce con
+  el BPM elegido. SAVE .MID lo guarda y ARRASTRA MIDI AL DAW lo suelta en tu proyecto.
+- **Diseno nuevo** con selector de color (Naranja, Cian, Verde, Magenta, Violeta, Amarillo).
 
 **Proximas fases:** deteccion de golpes, clasificacion, agrupacion, aislamiento (Clean), IA,
 patron MIDI, skins.

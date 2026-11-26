@@ -1,40 +1,35 @@
-# Drumkit Cloner (v0.2)
+# Drumkit Cloner (v0.4)
 
 Plugin de bateria hecho con JUCE: VST3 + Standalone (+ AU en Mac).
 
-**Incluye ahora:** 64 pads en 4 bancos (A-D), MIDI desde C1 (nota 36), arrastrar samples a los
-pads, y por pad: Gain, Pan, Tune, Attack, Fade, HP, LP (12 dB/oct), Choke, Mute, Solo y salida
-separada (Main + 8 salidas estereo). Todo automatizable desde el DAW.
+## Que hace
 
-**Novedades v0.2:**
-- **Corrector de pitch:** DETECT muestra la nota del sample; TUNE lo afina a la nota que elijas;
-  SNAP lo ajusta a la nota mas cercana; TUNE ALL afina todos los pads a la misma nota.
-- **Patron MIDI:** boton EDIT abre una rejilla de 32 pasos (1/16, 2 compases) por pad.
-  Click pone/quita, arrastrar pinta, click derecho cambia la fuerza. PLAY lo reproduce con
-  el BPM elegido. SAVE .MID lo guarda y ARRASTRA MIDI AL DAW lo suelta en tu proyecto.
-- **Diseno nuevo** con selector de color (Naranja, Cian, Verde, Magenta, Violeta, Amarillo).
+**Clonar kits** - Arrastra una cancion o un loop al panel SOURCE (o BROWSE). Detecta cada golpe, lo
+clasifica (kick, snare, clap, hat, open hat, tom, perc, cymbal), agrupa los que suenan igual y aisla un
+one-shot de cada grupo (mediana de todos los golpes). SENSITIVITY + RE-CLONE repiten el analisis.
 
-**Proximas fases:** deteccion de golpes, clasificacion, agrupacion, aislamiento (Clean), IA,
-patron MIDI, skins.
+**Editor visual del sample** - La onda gris es el original; la de color es como queda de verdad despues de
+cortar, fades, COMP y ganancia. Arrastra las asas START / END para cortar. El umbral del compresor se
+dibuja con lineas punteadas y los fades como rampas.
+
+**Corrector de pitch** - DETECT, TUNE (a la nota que elijas), SNAP (a la nota mas cercana) y TUNE ALL.
+
+**Patron MIDI** - EDIT abre la rejilla (32 pasos, 2 compases) con el nombre de cada instrumento a la izquierda.
+- click: pone/quita nota - arrastrar: pinta - click derecho: cambia la fuerza - shift+click: roll (2, 3 o 4 golpes por paso)
+- GENERATE crea un patron completo en el estilo elegido: Trap, Boom Bap, Hip Hop, Rap o Drill (INTENSITY = cuanta variacion).
+- HI-HATS regenera solo los hi-hats (con rolls estilo trap y open hats) sin tocar kick ni snare.
+- HUMANIZE: TIMING (hasta +-25 ms), VELO (+-30) y SWING.
+- SAVE .MID guarda el MIDI con el nombre de cada instrumento dentro del archivo ("C1 = KICK"),
+  y ARRASTRA MIDI AL DAW lo suelta en tu proyecto. Incluye swing y humanizacion.
+- SAVE .WAV renderiza el loop de audio con todos los ajustes de cada pad. La cola se pliega al inicio para que el loop no corte.
+
+**Estetica** - Pads que se iluminan al sonar (tambien desde el patron), colores por familia, knobs con brillo,
+selector de color (Naranja, Cian, Verde, Magenta, Violeta, Amarillo).
 
 ## Subirlo a GitHub
 
-```bash
-cd drumkit-cloner
-git init
-git add .
-git commit -m "Fase 1: sampler de 64 pads"
-git branch -M main
-git remote add origin https://github.com/TU_USUARIO/drumkit-cloner.git
-git push -u origin main
-```
-
-(Crea antes el repositorio vacio en github.com -> New repository, sin README.)
-
-## Compilar en la nube
-
-Al hacer `push`, GitHub Actions compila para Windows y Mac. Ve a la pestana **Actions**,
-abre la ultima ejecucion y descarga el plugin en **Artifacts**.
+Sube estos archivos sobrescribiendo los de tu repositorio y haz commit: GitHub Actions compila solo.
+Despues baja el plugin de Actions > Artifacts.
 
 ## Compilar en tu PC
 
@@ -50,19 +45,13 @@ El resultado queda en `build/DrumkitCloner_artefacts/Release/`.
 ## Instalar
 
 - **Windows:** copia la carpeta `Drumkit Cloner.vst3` a `C:\Program Files\Common Files\VST3`.
-- **Mac:** copia a `~/Library/Audio/Plug-Ins/VST3` (o `Components` para AU). Si macOS lo bloquea
-  por no estar firmado: `xattr -cr "Drumkit Cloner.vst3"`.
+- **Mac:** copia a `~/Library/Audio/Plug-Ins/VST3` (o `Components` para AU). Si macOS lo bloquea:
+  `xattr -cr "Drumkit Cloner.vst3"`.
 
-Luego reescanea plugins en tu DAW. Tambien puedes abrir la app Standalone para probar sin DAW.
+## Limitaciones
 
-## Antes de vender nada
-
-- Cambia `COMPANY_NAME`, `PRODUCT_NAME` y los codigos en `CMakeLists.txt`.
-- Revisa la licencia de JUCE en juce.com (gratis con limites de ingresos, AGPL o de pago).
-
-## Limitaciones de la Fase 1
-
-- El proyecto guarda la **ruta** de cada sample, no el audio; si mueves los archivos, no cargan
-  (se arregla en la Fase 10).
-- Un pad es monofonico (volver a tocarlo reinicia el sonido) y maximo 30 s por sample.
-- Los buffers de samples se liberan al cerrar el plugin, no al reemplazarlos.
+- La deteccion es solo por analisis de audio (sin IA): con voces o acordes marcados puede marcar golpes falsos.
+- Los nombres de instrumentos se ven en la rejilla del plugin y quedan escritos como texto dentro del .mid.
+  Que el piano roll de tu DAW los muestre depende del DAW (Ableton/FL no leen nombres de notas de un .mid).
+- El patron tiene su propio PLAY y BPM; todavia no sigue el transporte del DAW.
+- Antes de vender: cambia COMPANY_NAME y PRODUCT_NAME en `CMakeLists.txt` y revisa la licencia de JUCE.
